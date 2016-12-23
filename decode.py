@@ -406,7 +406,7 @@ class L3D(object):
             )
         ),
         ('rda_alarms', 'h',
-            BidField(
+            BitField(
                 'Indeterminate',
                 'Tower/Utilities',
                 'Pedestal',
@@ -2377,7 +2377,7 @@ class L3D(object):
         blk = self._buffer.read_struct(self.sym_block_fmt)
 
         self.sym_block = []
-        assert block.divider == -1, ('Bad divider for symbology block: {:d} should be -1'.format(blk.divider))
+        assert blk.divider == -1, ('Bad divider for symbology block: {:d} should be -1'.format(blk.divider))
         assert blk.block_id == 1, ('Bad block ID for symbology block: {:d} should be 1'.format(blk.block_id))
 
         for _ in range(blk.nlayer):

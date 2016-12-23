@@ -1,31 +1,28 @@
-from nexrad import L3D
-import colors
 import numpy as np
 import matplotlib.pyplot as plt
 from numpy import ma
 
-def scaled_elem(index, scale):
-	def inner(seq):
-		return seq[index] * scale
-	return inner
+from decode import L3D
+import colors
 
-radar = L3D('KOUN_SDUS54_N0QTLX_201305202016')
+fig, axes = plt.subplots(1, 2, figsize = (15, 8))
+for v, color, ax in zip(('N0Q', 'N0U'), ('NWSReflectivity', 'NWSVelocity'), axes):
+	f = L3D('examples/radar_data/KOUN_SDUS54_%sTLX_201305202016' % v)
+	
+	datadict = f.sym_block[0][0]
+	data = ma.array(datadict['data'])
+	data[data == 0] = ma.masked
 
-data = ma.array(radar.get_data()) * scaled_elem(2, 0.1)
-data[data==0] = ma.masked
-az = np.array(radar.get_start_azimuth() + radar.get_end_azimuth()[-1])
-rng = np.linspace(0, 460.0, data.shape[-1] + 1)
+	az = np.array(datadict['start_az'] + [datadict['end_az'][-1]])
+	rng = np.linspace(0, f.max_range, data.shape[-1] + 1)
 
-xlocs = rng * np.sin(np.deg2rad(az[:, np.newaxis])) * -1
-ylocs = rng * np.cos(np.deg2rad(az[:, np.newaxis])) * -1
+	xlocs = rng * np.sin(np.deg2rad(az[:, np.newaxis]))
+	ylocs = rng * np.cos(np.deg2rad(az[:, np.newaxis]))
 
-fig, axes = plt.subplots(1, 1, figsize = (8, 8))
-
-norm, cmap = colors.registry.get_with_steps('NWSReflectivityExpanded', 16, 16)
-axes.pcolormesh(xlocs, ylocs, data, norm = norm, cmap = cmap)
-axes.set_axis_bgcolor('black')
-axes.set_aspect('equal', 'datalim')
-axes.set_xlim(-25, 25)
-axes.set_ylim(-25, 25)
+	norm, cmap = colors.registry.get_with_steps(color, 16, 16)
+	ax.pcolormesh(xlocs, ylocs, data, norm = norm, cmap = cmap)
+	ax.set_aspect('equal', 'datalim')
+	ax.set_xlim(-40, 20)
+	ax.set_ylim(-30, 30)
 
 plt.show()
