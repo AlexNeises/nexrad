@@ -337,6 +337,469 @@ class LegacyMapper(DataMapper):
         self.lut = np.array(self.lut)
 
 @exporter.export
+class L2D(object):
+    AR2_BLOCKSIZE = 2432
+    CTM_HEADER_SIZE = 12
+    MISSING = float('nan')
+    RANGE_FOLD = float('nan')
+    def __init__(self, filename):
+        if is_string_like(filename):
+            if filename.endswith('.bz2'):
+                fobj = bz2.BZ2File(filename, 'rb')
+            elif filename.endswith('.gz'):
+                fobj = gzip.GzipFile(filename, 'rb')
+            else:
+                fobj = open(filename, 'rb')
+        else:
+            fobj = filename
+
+        self._buffer = IOBuffer.fromfile(fobj)
+        self._read_volume_header()
+        start = self._buffer.set_mark()
+
+        try:
+            self._buffer = IOBuffer(self._buffer.read_func(bzip_blocks_decompress_all))
+        except Exception:
+            self._buffer.jump_to(start)
+
+        self._read_data()
+
+    vol_hdr_fmt = NamedStruct([
+        ('version', '9s'),
+        ('vol_num', '3s'),
+        ('date',     'L'),
+        ('time_ms',  'L'),
+        ('stid',    '4s')
+    ], '>', 'VolHdr')
+
+    def _read_volume_header(self):
+        self.vol_hdr = self._buffer.read_struct(self.vol_hdr_fmt)
+        self.dt = nexrad_to_datetime(self.vol_hdr.date, self.vol_hdr.time_ms)
+        self.stid = self.vol_hdr.stid
+
+    msg_hdr_fmt = NamedStruct([
+        ('size_hw',     'H'),
+        ('rda_channel', 'B', 
+            BitField(
+                'Redundant Channel 1',
+                'Redundant Channel 2',
+                None,
+                'ORDA'
+            )
+        ),
+        ('msg_type',     'B'),
+        ('seq_num',      'H'),
+        ('date',         'H'),
+        ('time_ms',      'I'),
+        ('num_segments', 'H'),
+        ('segment_num',  'H')
+    ], '>', 'MsgHdr')
+
+    def _read_data(self):
+        self._msg_buf = {}
+        self.sweeps = []
+        self.rda_status = []
+        while not self._buffer.at_end():
+            self._buffer.clear_marks()
+            msg_start = self._buffer.set_mark()
+
+            self._buffer.skip(self.CTM_HEADER_SIZE)
+
+            msg_hdr = self._buffer.read_struct(self.msg_hdr_fmt)
+
+            if msg_hdr.size_hw:
+                decoder = '_decode_msg{:d}'.format(msg_hdr.msg_type)
+                if hasattr(self, decoder):
+                    getattr(self, decoder)(msg_hdr)
+                else:
+                    log.warning('Unknown message: %d', msg_hdr.msg_type)
+
+            if msg_hdr.msg_type != 31:
+                self._buffer.jump_to(msg_start, self.AR2_BLOCKSIZE)
+            else:
+                self._buffer.jump_to(msg_start, self.CTM_HEADER_SIZE + 2 * msg_hdr.size_hw)
+
+        if self._msg_buf:
+            log.warning('Remaining buffered messages segments for message type(s): %s', ' '.join(map(str, self._msg_buf.keys())))
+
+        del self._msg_buf
+
+    msg1_fmt = NamedStruct([
+        ('time_ms',            'L'),
+        ('date',               'H'),
+        ('unamb_range',        'H', scaler(0.1)),
+        ('az_angle',           'H', angle),
+        ('az_num',             'H'),
+        ('rad_status',         'H', remap_status),
+        ('el_angle',           'H', angle),
+        ('el_num',             'H'),
+        ('surv_first_gate',    'h', scaler(0.001)),
+        ('doppler_first_gate', 'h', scaler(0.001)),
+        ('surv_gate_width',    'H', scaler(0.001)),
+        ('doppler_gate_width', 'H', scaler(0.001)),
+        ('surv_num_gates',     'H'),
+        ('doppler_num_gates',  'H'),
+        ('cut_sector_num',     'H'),
+        ('calib_dbz0',         'f'),
+        ('ref_offset',         'H'),
+        ('vel_offset',         'H'),
+        ('sw_offset',          'H'),
+        ('dop_res',            'H', BitField(None, 0.5, 1.0)),
+        ('vcp',                'H'),
+        (None,                 '14x'),
+        ('nyq_vel',            'H', scaler(0.01)),
+        ('atmos_atten',        'H', scaler(0.001)),
+        ('tover',              'H', scaler(0.1)),
+        ('spot_blanking',      'B', BitField('Radial', 'Elevation', 'Volume')),
+        (None,                 '32x')
+    ], '>', 'Msg1Fmt')
+
+    msg1_data_hdr = namedtuple('Msg1DataHdr', 'name first_gate gate_width num_gates scale offset')
+
+    def _decode_msg1(self, msg_hdr):
+        msg_start = self._buffer.set_mark()
+        hdr = self._buffer.read_struct(self.msg1_fmt)
+        data_dict = dict()
+
+        read_info = []
+        if hdr.surv_num_gates and hdr.ref_offset:
+            read_info.append((hdr.ref_offset, self.msg1_data_hdr('REF', hdr.surv_first_gate, hdr.surv_gate_width, hdr.surv_num_gates, 2.0, 66.0)))
+
+        if hdr.vel_offset:
+            read_info.append((hdr.vel_offset, self.msg1_data_hdr('VEL', hdr.doppler_first_gate, hdr.doppler_gate_width, hdr.doppler_num_gates, 1. / hdr.dop_res, 129.0)))
+
+        if hdr.sw_offset:
+            read_info.append((hdr.sw_offset, self.msg1_data_hdr('SW', hdr.doppler_first_gate, hdr.doppler_gate_width, hdr.doppler_num_gates, 2.0, 129.0)))
+
+        for ptr, data_hdr in read_info:
+            self._buffer.jump_to(msg_start, ptr)
+            vals = np.array(self._buffer.read_binary(data_hdr.num_gates, 'B'))
+
+            scaled_vals = (vals - data_hdr.offset) / data_hdr.scale
+            scaled_vals[vals == 0] = self.MISSING
+            scaled_vals[vals == 1] = self.RANGE_FOLD
+
+            data_dict[data_hdr.name] = (data_hdr, scaled_vals)
+
+        self._add_sweep(hdr)
+        self.sweeps[-1].append((hdr, data_dict))
+
+    msg2_fmt = NamedStruct([
+        ('rda_status', 'H', BitField('None', 'Start-Up', 'Standby', 'Restart',
+                                     'Operate', 'Spare', 'Off-line Operate')),
+        ('op_status', 'H', BitField('Disabled', 'On-Line',
+                                    'Maintenance Action Required',
+                                    'Maintenance Action Mandatory',
+                                    'Commanded Shut Down', 'Inoperable',
+                                    'Automatic Calibration')),
+        ('control_status', 'H', BitField('None', 'Local Only',
+                                         'RPG (Remote) Only', 'Either')),
+        ('aux_power_gen_state', 'H', BitField('Switch to Aux Power',
+                                              'Utility PWR Available',
+                                              'Generator On',
+                                              'Transfer Switch Manual',
+                                              'Commanded Switchover')),
+        ('avg_tx_pwr', 'H'), ('ref_calib_cor', 'h'),
+        ('data_transmission_enabled', 'H', BitField('None', 'None',
+                                                    'Reflectivity', 'Velocity', 'Width')),
+        ('vcp_num', 'h'), ('rda_control_auth', 'H', BitField('No Action',
+                                                             'Local Control Requested',
+                                                             'Remote Control Enabled')),
+        ('rda_build', 'H', version), ('op_mode', 'H', BitField('None', 'Test',
+                                                               'Operational', 'Maintenance')),
+        ('super_res_status', 'H', BitField('None', 'Enabled', 'Disabled')),
+        ('cmd_status', 'H', Bits(6)),
+        ('avset_status', 'H', BitField('None', 'Enabled', 'Disabled')),
+        ('rda_alarm_status', 'H', BitField('No Alarms', 'Tower/Utilities',
+                                           'Pedestal', 'Transmitter', 'Receiver',
+                                           'RDA Control', 'Communication',
+                                           'Signal Processor')),
+        ('command_acknowledge', 'H', BitField('Remote VCP Received',
+                                              'Clutter Bypass map received',
+                                              'Redundant Chan Ctrl Cmd received')),
+        ('channel_control_status', 'H'),
+        ('spot_blanking', 'H', BitField('Enabled', 'Disabled')),
+        ('bypass_map_gen_date', 'H'), ('bypass_map_gen_time', 'H'),
+        ('clutter_filter_map_gen_date', 'H'), ('clutter_filter_map_gen_time', 'H'),
+        (None, '2x'),
+        ('transition_pwr_src_state', 'H', BitField('Off', 'OK')),
+        ('RMS_control_status', 'H', BitField('RMS in control', 'RDA in control')),
+        # See Table IV-A for definition of alarms
+        (None, '2x'), ('alarms', '28s', Array('>14H'))], '>', 'Msg2Fmt')
+
+    def _decode_msg2(self, msg_hdr):
+        self.rda_status.append(self._buffer.read_struct(self.msg2_fmt))
+        self._check_size(msg_hdr, self.msg2_fmt.size)
+
+    def _decode_msg3(self, msg_hdr):
+        from _msg3 import descriptions, fields
+        self.maintenance_data_desc = descriptions
+        msg_fmt = DictStruct(fields, '>')
+        self.maintenance_data = self._buffer.read_struct(msg_fmt)
+        self._check_size(msg_hdr, msg_fmt.size)
+
+    vcp_fmt = NamedStruct([('size_hw', 'H'), ('pattern_type', 'H'),
+                           ('num', 'H'), ('num_el_cuts', 'H'), ('clutter_map_group', 'H'),
+                           ('dop_res', 'B', BitField(None, 0.5, 1.0)),
+                           ('pulse_width', 'B', BitField('None', 'Short', 'Long')),
+                           (None, '10x'), ('els', None)], '>', 'VCPFmt')
+
+    vcp_el_fmt = NamedStruct([('el_angle', 'H', angle),
+                              ('channel_config', 'B', Enum('Constant Phase', 'Random Phase',
+                                                           'SZ2 Phase')),
+                              ('waveform', 'B', Enum('None', 'Contiguous Surveillance',
+                                                     'Contig. Doppler with Ambiguity Res.',
+                                                     'Contig. Doppler without Ambiguity Res.',
+                                                     'Batch', 'Staggered Pulse Pair')),
+                              ('super_res', 'B', BitField('0.5 azimuth and 0.25km range res.',
+                                                          'Doppler to 300km',
+                                                          'Dual Polarization Control',
+                                                          'Dual Polarization to 300km')),
+                              ('surv_prf_num', 'B'), ('surv_pulse_count', 'H'),
+                              ('az_rate', 'h', az_rate),
+                              ('ref_thresh', 'h', scaler(0.125)),
+                              ('vel_thresh', 'h', scaler(0.125)),
+                              ('sw_thresh', 'h', scaler(0.125)),
+                              ('zdr_thresh', 'h', scaler(0.125)),
+                              ('phidp_thresh', 'h', scaler(0.125)),
+                              ('rhohv_thresh', 'h', scaler(0.125)),
+                              ('sector1_edge', 'H', angle),
+                              ('sector1_doppler_prf_num', 'H'),
+                              ('sector1_pulse_count', 'H'), (None, '2x'),
+                              ('sector2_edge', 'H', angle),
+                              ('sector2_doppler_prf_num', 'H'),
+                              ('sector2_pulse_count', 'H'), (None, '2x'),
+                              ('sector3_edge', 'H', angle),
+                              ('sector3_doppler_prf_num', 'H'),
+                              ('sector3_pulse_count', 'H'), (None, '2x')], '>', 'VCPEl')
+
+    def _decode_msg5(self, msg_hdr):
+        vcp_info = self._buffer.read_struct(self.vcp_fmt)
+        els = [self._buffer.read_struct(self.vcp_el_fmt) for _ in range(vcp_info.num_el_cuts)]
+        self.vcp_info = vcp_info._replace(els=els)
+        self._check_size(msg_hdr,
+                         self.vcp_fmt.size + vcp_info.num_el_cuts * self.vcp_el_fmt.size)
+
+    def _decode_msg13(self, msg_hdr):
+        data = self._buffer_segment(msg_hdr)
+        if data:
+            data = list(Struct('>{:d}h'.format(len(data) // 2)).unpack(data))
+            bmap = dict()
+            date, time, num_el = data[:3]
+            bmap['datetime'] = nexrad_to_datetime(date, time)
+
+            offset = 3
+            bmap['data'] = []
+            bit_conv = Bits(16)
+            for e in range(num_el):
+                seg_num = data[offset]
+                offset += 1
+                assert seg_num == (e + 1), ('Message 13 segments out of sync --'
+                                            ' read {} but on {}'.format(seg_num, e + 1))
+
+                az_data = []
+                for _ in range(360):
+                    gates = []
+                    for _ in range(32):
+                        gates.extend(bit_conv(data[offset]))
+                        offset += 1
+                    az_data.append(gates)
+                bmap['data'].append(az_data)
+
+            self.clutter_filter_bypass_map = bmap
+
+            if offset != len(data):
+                log.warning('Message 13 left data -- Used: %d Avail: %d', offset, len(data))
+
+    msg15_code_map = {0: 'Bypass Filter', 1: 'Bypass map in Control',
+                      2: 'Force Filter'}
+
+    def _decode_msg15(self, msg_hdr):
+        # buffer the segments until we have the whole thing. The data
+        # will be returned concatenated when this is the case
+        data = self._buffer_segment(msg_hdr)
+        if data:
+            data = list(Struct('>{:d}h'.format(len(data) // 2)).unpack(data))
+            cmap = dict()
+            date, time, num_el = data[:3]
+            cmap['datetime'] = nexrad_to_datetime(date, time)
+
+            offset = 3
+            cmap['data'] = []
+            for _ in range(num_el):
+                az_data = []
+                for _ in range(360):
+                    num_rng = data[offset]
+                    offset += 1
+
+                    codes = data[offset:2 * num_rng + offset:2]
+                    offset += 1
+
+                    ends = data[offset:2 * num_rng + offset:2]
+                    offset += 2 * num_rng - 1
+                    az_data.append(list(zip(ends, codes)))
+                cmap['data'].append(az_data)
+
+            self.clutter_filter_map = cmap
+            if offset != len(data):
+                log.warning('Message 15 left data -- Used: %d Avail: %d', offset, len(data))
+
+    def _decode_msg18(self, msg_hdr):
+        # buffer the segments until we have the whole thing. The data
+        # will be returned concatenated when this is the case
+        data = self._buffer_segment(msg_hdr)
+        if data:
+            from _msg18 import descriptions, fields
+            self.rda_adaptation_desc = descriptions
+
+            # Can't use NamedStruct because we have more than 255 items--this
+            # is a CPython limit for arguments.
+            msg_fmt = DictStruct(fields, '>')
+            self.rda = msg_fmt.unpack(data)
+            for num in (11, 21, 31, 32, 300, 301):
+                attr = 'VCPAT' + str(num)
+                dat = self.rda[attr]
+                vcp_hdr = self.vcp_fmt.unpack_from(dat, 0)
+                off = self.vcp_fmt.size
+                els = []
+                for _ in range(vcp_hdr.num_el_cuts):
+                    els.append(self.vcp_el_fmt.unpack_from(dat, off))
+                    off += self.vcp_el_fmt.size
+                self.rda[attr] = vcp_hdr._replace(els=els)
+
+    msg31_data_hdr_fmt = NamedStruct([('stid', '4s'), ('time_ms', 'L'),
+                                      ('date', 'H'), ('az_num', 'H'),
+                                      ('az_angle', 'f'), ('compression', 'B'),
+                                      (None, 'x'), ('rad_length', 'H'),
+                                      ('az_spacing', 'B'),
+                                      ('rad_status', 'B', remap_status),
+                                      ('el_num', 'B'), ('sector_num', 'B'),
+                                      ('el_angle', 'f'),
+                                      ('spot_blanking', 'B', BitField('Radial', 'Elevation',
+                                                                      'Volume')),
+                                      ('az_index_mode', 'B', scaler(0.01)),
+                                      ('num_data_blks', 'H'),
+                                      ('vol_const_ptr', 'L'), ('el_const_ptr', 'L'),
+                                      ('rad_const_ptr', 'L')], '>', 'Msg31DataHdr')
+
+    msg31_vol_const_fmt = NamedStruct([('type', 's'), ('name', '3s'),
+                                       ('size', 'H'), ('major', 'B'),
+                                       ('minor', 'B'), ('lat', 'f'), ('lon', 'f'),
+                                       ('site_amsl', 'h'), ('feedhorn_agl', 'H'),
+                                       ('calib_dbz', 'f'), ('txpower_h', 'f'),
+                                       ('txpower_v', 'f'), ('sys_zdr', 'f'),
+                                       ('phidp0', 'f'), ('vcp', 'H'),
+                                       ('processing_status', 'H', BitField('RxR Noise',
+                                                                           'CBT'))],
+                                      '>', 'VolConsts')
+
+    msg31_el_const_fmt = NamedStruct([('type', 's'), ('name', '3s'),
+                                      ('size', 'H'), ('atmos_atten', 'h', scaler(0.001)),
+                                      ('calib_dbz0', 'f')], '>', 'ElConsts')
+
+    rad_const_fmt_v1 = NamedStruct([('type', 's'), ('name', '3s'), ('size', 'H'),
+                                    ('unamb_range', 'H', scaler(0.1)),
+                                    ('noise_h', 'f'), ('noise_v', 'f'),
+                                    ('nyq_vel', 'H', scaler(0.01)),
+                                    (None, '2x')], '>', 'RadConstsV1')
+    rad_const_fmt_v2 = NamedStruct([('type', 's'), ('name', '3s'), ('size', 'H'),
+                                    ('unamb_range', 'H', scaler(0.1)),
+                                    ('noise_h', 'f'), ('noise_v', 'f'),
+                                    ('nyq_vel', 'H', scaler(0.01)),
+                                    (None, '2x'), ('calib_dbz0_h', 'f'),
+                                    ('calib_dbz0_v', 'f')], '>', 'RadConstsV2')
+
+    data_block_fmt = NamedStruct([('type', 's'), ('name', '3s'),
+                                  ('reserved', 'L'), ('num_gates', 'H'),
+                                  ('first_gate', 'H', scaler(0.001)),
+                                  ('gate_width', 'H', scaler(0.001)),
+                                  ('tover', 'H', scaler(0.1)),
+                                  ('snr_thresh', 'h', scaler(0.1)),
+                                  ('recombined', 'B', BitField('Azimuths', 'Gates')),
+                                  ('data_size', 'B', bits_to_code),
+                                  ('scale', 'f'), ('offset', 'f')], '>', 'DataBlockHdr')
+
+    def _decode_msg31(self, msg_hdr):
+        msg_start = self._buffer.set_mark()
+        data_hdr = self._buffer.read_struct(self.msg31_data_hdr_fmt)
+
+        # Read all the data block pointers separately. This simplifies just
+        # iterating over them
+        ptrs = self._buffer.read_binary(6, '>L')
+
+        assert data_hdr.compression == 0, 'Compressed message 31 not supported!'
+
+        self._buffer.jump_to(msg_start, data_hdr.vol_const_ptr)
+        vol_consts = self._buffer.read_struct(self.msg31_vol_const_fmt)
+
+        self._buffer.jump_to(msg_start, data_hdr.el_const_ptr)
+        el_consts = self._buffer.read_struct(self.msg31_el_const_fmt)
+
+        self._buffer.jump_to(msg_start, data_hdr.rad_const_ptr)
+        # Major version jumped with Build 14.0
+        if vol_consts.major < 2:
+            rad_consts = self._buffer.read_struct(self.rad_const_fmt_v1)
+        else:
+            rad_consts = self._buffer.read_struct(self.rad_const_fmt_v2)
+
+        data = dict()
+        block_count = 3
+        for ptr in ptrs:
+            if ptr:
+                block_count += 1
+                self._buffer.jump_to(msg_start, ptr)
+                hdr = self._buffer.read_struct(self.data_block_fmt)
+                vals = np.array(self._buffer.read_binary(hdr.num_gates,
+                                                         '>' + hdr.data_size))
+                scaled_vals = (vals - hdr.offset) / hdr.scale
+                scaled_vals[vals == 0] = self.MISSING
+                scaled_vals[vals == 1] = self.RANGE_FOLD
+                data[hdr.name.strip()] = (hdr, scaled_vals)
+
+        self._add_sweep(data_hdr)
+
+        self.sweeps[-1].append((data_hdr, vol_consts, el_consts, rad_consts, data))
+
+        if data_hdr.num_data_blks != block_count:
+            log.warning('Incorrect number of blocks detected -- Got %d'
+                        'instead of %d', block_count, data_hdr.num_data_blks)
+        assert data_hdr.rad_length == self._buffer.offset_from(msg_start)
+
+    def _buffer_segment(self, msg_hdr):
+        # Add to the buffer
+        bufs = self._msg_buf.setdefault(msg_hdr.msg_type, dict())
+        bufs[msg_hdr.segment_num] = self._buffer.read(2 * msg_hdr.size_hw -
+                                                      self.msg_hdr_fmt.size)
+
+        # Warn for badly formatted data
+        if len(bufs) != msg_hdr.segment_num:
+            log.warning('Segment out of order (Got: %d Count: %d) for message type %d.',
+                        msg_hdr.segment_num, len(bufs), msg_hdr.msg_type)
+
+        # If we're complete, return the full collection of data
+        if msg_hdr.num_segments == len(bufs):
+            self._msg_buf.pop(msg_hdr.msg_type)
+            return b''.join(bytes(item[1]) for item in sorted(bufs.items()))
+
+    def _add_sweep(self, hdr):
+        if not self.sweeps and not hdr.rad_status & START_VOLUME:
+            log.warning('Missed start of volume!')
+
+        if hdr.rad_status & START_ELEVATION:
+            self.sweeps.append([])
+
+        if len(self.sweeps) != hdr.el_num:
+            log.warning('Missed elevation -- Have %d but data on %d.'
+                        ' Compensating...', len(self.sweeps), hdr.el_num)
+            while len(self.sweeps) < hdr.el_num:
+                self.sweeps.append([])
+
+    def _check_size(self, msg_hdr, size):
+        hdr_size = msg_hdr.size_hw * 2 - self.msg_hdr_fmt.size
+        assert size == hdr_size, ('Message type {} should be {} bytes '
+                                  'but got {}'.format(msg_hdr.msg_type, size, hdr_size))
+
+@exporter.export
 class L3D(object):
     ij_to_km = 0.25
     
