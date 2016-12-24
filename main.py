@@ -22,7 +22,7 @@ import colors
 # NAH - 165: Digital Hydrometeor Classification
 
 v = 'N0Q'
-color = 'NWSReflectivity'
+color = 'NWSReflectivityExtended'
 
 fig, ax = plt.subplots(1, 2, figsize = (15, 8))
 f = L3D('examples/radar_data/KOUN_SDUS54_%sTLX_201305202016' % v)
@@ -45,12 +45,37 @@ ax[0].set_axis_bgcolor('black')
 ax[0].set_xlim(-40, 20)
 ax[0].set_ylim(-30, 30)
 
+# f = L2D('examples/radar_data/KTLX20130520_201643_V06.gz')
+# f.sweeps[0][0]
 
+# # sweep = 0
+# sweep = 1
+# az = np.array([ray[0].az_angle for ray in f.sweeps[sweep]])
+# ref_hdr = f.sweeps[sweep][0][4][b'REF'][0]
+# ref_range = np.arange(ref_hdr.num_gates) * ref_hdr.gate_width + ref_hdr.first_gate
+# ref = np.array([ray[4][b'REF'][1] for ray in f.sweeps[sweep]])
+
+# data = ma.array(ref)
+# data[np.isnan(data)] = ma.masked
+
+# print data.shape
+
+# xlocs = ref_range * np.sin(np.deg2rad(az[:, np.newaxis]))
+# ylocs = ref_range * np.cos(np.deg2rad(az[:, np.newaxis]))
+
+# cmap = colors.registry.get_colortable('NWSReflectivity')
+# ax[0].pcolormesh(xlocs, ylocs, data, cmap = cmap)
+# ax[0].set_aspect('equal', 'datalim')
+# ax[0].set_title('Level II Ref')
+# ax[0].set_axis_bgcolor('black')
+# ax[0].set_xlim(-40, 20)
+# ax[0].set_ylim(-30, 30)
 
 f = L2D('examples/radar_data/KTLX20130520_201643_V06.gz')
 f.sweeps[0][0]
 
-sweep = 0
+# sweep = 0
+sweep = 1
 az = np.array([ray[0].az_angle for ray in f.sweeps[sweep]])
 ref_hdr = f.sweeps[sweep][0][4][b'REF'][0]
 ref_range = np.arange(ref_hdr.num_gates) * ref_hdr.gate_width + ref_hdr.first_gate
@@ -59,10 +84,12 @@ ref = np.array([ray[4][b'REF'][1] for ray in f.sweeps[sweep]])
 data = ma.array(ref)
 data[np.isnan(data)] = ma.masked
 
+print data.shape
+
 xlocs = ref_range * np.sin(np.deg2rad(az[:, np.newaxis]))
 ylocs = ref_range * np.cos(np.deg2rad(az[:, np.newaxis]))
 
-cmap = colors.registry.get_colortable('NWSReflectivity')
+cmap = colors.registry.get_colortable('NWSReflectivityExtended')
 ax[1].pcolormesh(xlocs, ylocs, data, cmap = cmap)
 ax[1].set_aspect('equal', 'datalim')
 ax[1].set_title('Level II Ref')
